@@ -431,9 +431,9 @@ class OrderSolver:
                 if qty <= 0:
                     break  # 全部通过空隙填充完成
 
-                # ==== 步骤 B：标准整层装箱 ====
-                layout = self._get_layout(name, specs, current.remaining_height())
-                if layout is None:
+                # ==== 步骤 B：标准整层装箱（使用完整多层方案） ====
+                plan = self._get_full_plan(name, specs, current.remaining_height())
+                if plan is None:
                     if current.height == self.bH:
                         # 即使空托盘都放不下 → 跳过此 SKU
                         print(f"跳过 {name}：尺寸超出托盘限制。")
@@ -445,29 +445,23 @@ class OrderSolver:
                         current = _new_pallet()
                         continue
 
-                per_layer = layout["count"]   # 每层可放置数量
-                layer_h   = layout["height"]  # 层高
-                rem_h     = current.remaining_height()
+                # 按方案中的每层逐层添加（可能包含不同朝向的层）
+                placed_any = False
+                for plan_layer in plan:
+                    if qty <= 0:
+                        break
+                    if plan_layer["height"] > current.remaining_height():
+                        break  # 后续层放不下了
+                    actual = min(qty, plan_layer["count"])
+                    current.add_layer(name, plan_layer, count_override=actual)
+                    qty -= actual
+                    placed_any = True
 
-                # 计算可以放多少层
-                max_layers = int(rem_h // layer_h)
-                needed     = math.ceil(qty / per_layer)
-                take       = min(max_layers, needed)
-
-                if take == 0:
-                    # 已经没有垂直空间了 → 封板
+                if not placed_any:
+                    # 一层都放不进 → 封板
                     pallets.append(self._to_dict(current, len(pallets) + 1))
                     current = _new_pallet()
                     continue
-
-                # 逐层添加到托盘
-                remaining = min(qty, take * per_layer)
-                for _ in range(take):
-                    actual = min(remaining, per_layer)
-                    current.add_layer(name, layout, count_override=actual)
-                    remaining -= actual
-
-                qty -= min(qty, take * per_layer)
 
             idx += 1
 
@@ -514,27 +508,31 @@ class OrderSolver:
 
         return qty
 
-    def _get_layout(self, name, specs, remaining_h):
+    def _get_full_plan(self, name, specs, remaining_h):
         """
-        获取一个能在 remaining_h 内放置的最优单层布局。
-        优先使用缓存的最优布局；若放不下，则根据实际剩余高度重新计算。
+        获取一个能在 remaining_h 内放置的最优多层方案（背包 DP 结果）。
+        优先使用缓存的最优方案；若放不下，则根据实际剩余高度重新计算。
+        返回: 层列表 [{height, count, items, dims, ...}, ...] 或 None
         """
-        # 首次计算时缓存最优布局
+        # 首次计算时缓存完整的多层方案
         if name not in self._layout_cache:
             ps = PalletSolver(self.pW, self.pL, self.usable_h,
                               specs["w"], specs["l"], specs["h"], self.tol)
             sol = ps.solve()
-            self._layout_cache[name] = sol["layers"][0] if sol["layers"] else None
+            self._layout_cache[name] = sol["layers"] if sol["layers"] else None
 
         opt = self._layout_cache[name]
-        if opt and opt["height"] <= remaining_h:
-            return opt  # 最优布局能放进剩余空间，直接使用
+        if opt:
+            # 检查缓存方案的总高度是否能放进剩余空间
+            total_plan_h = sum(ly["height"] for ly in opt)
+            if total_plan_h <= remaining_h:
+                return opt  # 完整方案能放进剩余空间
 
-        # 自适应：用实际剩余高度重新求解（可能选择不同的摆放方向）
+        # 自适应：用实际剩余高度重新求解（可能得到不同的层组合）
         ps = PalletSolver(self.pW, self.pL, remaining_h,
                           specs["w"], specs["l"], specs["h"], self.tol)
         sol = ps.solve()
-        return sol["layers"][0] if sol["layers"] else None
+        return sol["layers"] if sol["layers"] else None
 
     @staticmethod
     def _to_dict(p, pid):
