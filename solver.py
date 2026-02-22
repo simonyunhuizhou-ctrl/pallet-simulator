@@ -298,7 +298,7 @@ class Pallet:
         self.maxH = maxH
         self.tol = tol
         self.layers: list[dict] = []      # 已放置的层列表
-        self.skus: set[str] = set()       # 此托盘包含的所有 SKU 名称
+        self.skus: dict[str, bool] = {}   # 此托盘包含的所有 SKU 名称 (通过字典保持插入顺序)
         self.height = bH                  # 当前已使用的总高度
 
     def remaining_height(self):
@@ -333,7 +333,7 @@ class Pallet:
             "count":  layer["count"],
         })
         self.height += layer["height"]
-        self.skus.add(sku_name)
+        self.skus[sku_name] = True
 
     def add_to_top_layer(self, sku_name, new_items, new_h):
         """
@@ -357,7 +357,7 @@ class Pallet:
             self.height += new_h - top["height"]
             top["height"] = new_h
 
-        self.skus.add(sku_name)
+        self.skus[sku_name] = True
 
 
 # ================================================================== #
@@ -396,8 +396,8 @@ class OrderSolver:
         返回:
             托盘字典列表
         """
-        # 策略：「自下而上(Bottom-Up)」—— 反转订单，让重 / 大的物品先进入底层
-        stream = [dict(x) for x in reversed(order_items)]
+        # 策略：按原订单顺序装箱
+        stream = [dict(x) for x in order_items]
         sku_specs = {x["name"]: x for x in order_items}  # SKU 名称 → 规格
 
         pallets: list[dict] = []
@@ -541,6 +541,6 @@ class OrderSolver:
             "id":          f"Pallet-{pid}",
             "type":        "Mixed" if len(p.skus) > 1 else "Full",
             "layers":      p.layers,
-            "skus":        list(p.skus),
+            "skus":        list(p.skus.keys()),
             "total_count": sum(ly["count"] for ly in p.layers),
         }

@@ -91,12 +91,13 @@ DEFAULTS = {
     "palletL": 48.0,   "palletW": 40.0,
     "baseH":    6.0,   "maxH":   54.0,
     "tolerance": 0.0,
+    "palletWeight": 40.0,
     "itemL":  27.5,    "itemW":  17.5,    "itemH": 12.5,
 }
 
-CSV_REQUIRED_COLUMNS = ["Item Name", "Total Case", "Length", "Width", "Height"]
+CSV_REQUIRED_COLUMNS = ["Item Name", "Case Pack", "Total Case", "Length", "Width", "Height", "Weight"]
 
-CSV_TEMPLATE = "Item Name,Total Case,Length,Width,Height\nSample Item A,10,12,8,6\nSample Item B,5,10,10,10\n"
+CSV_TEMPLATE = "Item Name,Case Pack,Total Case,Length,Width,Height,Weight\nSample Item A,12,10,12,8,6,2\nSample Item B,6,5,10,10,10,5\n"
 
 # ------------------------------------------------------------------ #
 #  Helper: Stable color per SKU
@@ -271,6 +272,10 @@ with st.sidebar:
         "Tolerance / Overhang (in)", value=DEFAULTS["tolerance"], min_value=0.0, step=0.25,
         help="Allowed overhang per side (tolerance), e.g. 0.5 inches",
     )
+    pallet_weight = st.number_input(
+        "Empty Pallet Weight", value=DEFAULTS["palletWeight"], min_value=0.0, step=1.0,
+        help="Weight of the empty pallet itself (used for total weight calculation)",
+    )
 
 
 # ------------------------------------------------------------------ #
@@ -406,14 +411,18 @@ with tab_order:
         uploaded_file = st.file_uploader(
             "📤 Import Order CSV",
             type=["csv"],
-            help="Upload a CSV file with columns: Item Name, Total Case, Length, Width, Height",
+            help="Upload a CSV file with columns: Item Name, Case Pack, Total Case, Length, Width, Height, Weight",
         )
 
-        # Parse uploaded CSV
+        # Parse CSV
         order_data = []
+        file_content = None
         if uploaded_file is not None:
+            file_content = uploaded_file.read()
+
+        if file_content is not None:
             try:
-                raw = uploaded_file.read().decode("utf-8-sig")
+                raw = file_content.decode("utf-8-sig")
                 # Normalize all line-ending styles (\r\n, \r, \n) to \n
                 content = raw.replace("\r\n", "\n").replace("\r", "\n")
                 reader = csv.DictReader(io.StringIO(content))
@@ -430,17 +439,19 @@ with tab_order:
                             row = {k.strip(): v for k, v in raw_row.items()}
                             try:
                                 name   = row.get("Item Name", "Unknown")
+                                case_pack = int(row.get("Case Pack", 1))
                                 qty    = int(row.get("Total Case", 0))
                                 length = float(row.get("Length", 0))
                                 width  = float(row.get("Width", 0))
                                 height = float(row.get("Height", 0))
+                                weight = float(row.get("Weight", 0))
                             except ValueError:
                                 continue
                             if qty <= 0 or length <= 0 or width <= 0 or height <= 0:
                                 continue
                             order_data.append({
-                                "name": name, "qty": qty,
-                                "l": length, "w": width, "h": height,
+                                "name": name, "case_pack": case_pack, "qty": qty,
+                                "l": length, "w": width, "h": height, "weight": weight,
                             })
 
                         if order_data:
@@ -448,7 +459,7 @@ with tab_order:
                             # Show preview
                             preview_df = pd.DataFrame([
                                 {"Item": d["name"], "Qty": d["qty"],
-                                 "Dims": f'{d["l"]}×{d["w"]}×{d["h"]}'}
+                                 "Dims": f'{d["l"]}×{d["w"]}×{d["h"]}', "Weight": d.get("weight", 0)}
                                 for d in order_data
                             ])
                             st.dataframe(preview_df, use_container_width=True, hide_index=True, height=200)
@@ -480,12 +491,25 @@ with tab_order:
                     if not pallets:
                         st.warning("No pallets generated. Check your input dimensions.")
                     else:
+                        for p in pallets:
+                            pw = pallet_weight
+                            sku_qty = {}
+                            for layer in p["layers"]:
+                                for item in layer.get("items", []):
+                                    sku = item.get("sku", layer.get("sku", "Unknown"))
+                                    sku_qty[sku] = sku_qty.get(sku, 0) + 1
+                            for sku, qty in sku_qty.items():
+                                w = next((d["weight"] for d in order_data if d["name"] == sku), 0)
+                                pw += w * qty
+                            p["total_weight"] = pw
+
                         # Store in session state for pallet selection
                         st.session_state["plan_results"] = pallets
+                        st.session_state["plan_order_data"] = order_data
 
                         # Summary metrics
                         total_items = sum(p["total_count"] for p in pallets)
-                        m1, m2, m3 = st.columns(3)
+                        m1, m2, m3, m4 = st.columns(4)
                         with m1:
                             st.markdown(f"""
                             <div class="result-card">
@@ -509,6 +533,13 @@ with tab_order:
                                 <p>Full / Mixed Pallets</p>
                             </div>
                             """, unsafe_allow_html=True)
+                        with m4:
+                            st.markdown(f"""
+                            <div class="result-card">
+                                <h2>{sum(p['total_weight'] for p in pallets):.1f}</h2>
+                                <p>Total Weight</p>
+                            </div>
+                            """, unsafe_allow_html=True)
 
                 except Exception as exc:
                     st.error(f"❌ Planning error: {exc}")
@@ -517,8 +548,50 @@ with tab_order:
         # Display results if available
         if "plan_results" in st.session_state and st.session_state["plan_results"]:
             pallets = st.session_state["plan_results"]
+            stored_order_data = st.session_state.get("plan_order_data", [])
 
             st.markdown("---")
+
+            # Export pallet details
+            export_data = []
+            sku_order = {d["name"]: i for i, d in enumerate(stored_order_data)}
+            for i, p in enumerate(pallets):
+                sku_qty = {}
+                for layer in p["layers"]:
+                    for item in layer.get("items", []):
+                        sku = item.get("sku", layer.get("sku", "Unknown"))
+                        sku_qty[sku] = sku_qty.get(sku, 0) + 1
+                for sku, qty in sku_qty.items():
+                    order_item = next((d for d in stored_order_data if d["name"] == sku), None)
+                    w = order_item["weight"] if order_item else 0.0
+                    cp = order_item["case_pack"] if order_item else 1
+                    total_items = cp * qty
+                    
+                    export_data.append({
+                        "Pallet ID": i + 1,
+                        "Pallet Type": p["type"],
+                        "SKU": sku,
+                        "Case Pack": cp,
+                        "Total Cases": qty,
+                        "Total Items": total_items,
+                        "Box Weight": w,
+                        "Subtotal Weight": w * qty,
+                        "Pallet Empty Weight": pallet_weight,
+                        "Total Pallet Weight": p.get("total_weight", 0),
+                        "_sort_idx": sku_order.get(sku, 9999)
+                    })
+            if export_data:
+                export_df = pd.DataFrame(export_data)
+                export_df = export_df.sort_values(by=["Pallet ID", "_sort_idx"]).drop(columns=["_sort_idx"])
+                csv_export = export_df.to_csv(index=False).encode('utf-8-sig')
+                
+                st.download_button(
+                    label="📤 Export Pallet Details (CSV)",
+                    data=csv_export,
+                    file_name="Pallet_Details.csv",
+                    mime="text/csv",
+                    use_container_width=True
+                )
 
             # Pallet selector
             pallet_options = []
@@ -527,7 +600,7 @@ with tab_order:
                 if len(p["skus"]) > 3:
                     sku_label += f" +{len(p['skus'])-3} more"
                 pallet_options.append(
-                    f"Pallet {i+1} — {p['type']} — {p['total_count']} items — {sku_label}"
+                    f"Pallet {i+1} — {p['type']} — {p['total_count']} items — Wt: {p.get('total_weight', 0):.1f} — {sku_label}"
                 )
 
             selected_idx = st.selectbox(
@@ -538,32 +611,45 @@ with tab_order:
 
             pallet = pallets[selected_idx]
 
-            # Pallet detail table
-            st.markdown(f"#### 📋 Pallet {selected_idx + 1} Contents")
-            sku_counts = {}
-            for layer in pallet["layers"]:
-                for item in layer.get("items", []):
-                    sku = item.get("sku", layer.get("sku", "Unknown"))
-                    sku_counts[sku] = sku_counts.get(sku, 0) + 1
+            c_details, c_viz = st.columns([1, 2.5], gap="large")
 
-            detail_df = pd.DataFrame([
-                {"SKU": sku, "Quantity": qty, "Color": color_for_sku(sku)}
-                for sku, qty in sku_counts.items()
-            ])
+            with c_details:
+                stacked_h = sum(layer["height"] for layer in pallet["layers"])
+                actual_h = base_H + stacked_h
+                
+                st.markdown(f"#### 📋 Pallet {selected_idx + 1} Details")
+                st.info(f"**Dimensions (L×W×H):**\n\n{pallet_L}\" × {pallet_W}\" × {actual_h:.1f}\"")
+                st.info(f"**Total Weight:**\n\n{pallet.get('total_weight', 0):.1f}")
 
-            # Show without color column (it's for internal use)
-            st.dataframe(
-                detail_df[["SKU", "Quantity"]],
-                use_container_width=True, hide_index=True,
-            )
+                # Pallet detail table
+                sku_counts = {}
+                for layer in pallet["layers"]:
+                    for item in layer.get("items", []):
+                        sku = item.get("sku", layer.get("sku", "Unknown"))
+                        sku_counts[sku] = sku_counts.get(sku, 0) + 1
 
-            # 3D visualization
-            fig = draw_pallet_3d(
-                pallet_W, pallet_L, base_H,
-                pallet["layers"], tolerance,
-                color_mode="sku", height_limit=max_H,
-            )
-            st.plotly_chart(fig, use_container_width=True, key=f"order_3d_{selected_idx}")
+                detail_df = pd.DataFrame([
+                    {"SKU": sku, "Quantity": qty, "Color": color_for_sku(sku)}
+                    for sku, qty in sku_counts.items()
+                ])
+
+                # Sort detail df by original order too
+                detail_df["_sort_idx"] = detail_df["SKU"].map(sku_order).fillna(9999)
+                detail_df = detail_df.sort_values(by="_sort_idx").drop(columns=["_sort_idx"])
+
+                st.dataframe(
+                    detail_df[["SKU", "Quantity"]],
+                    use_container_width=True, hide_index=True,
+                )
+
+            with c_viz:
+                # 3D visualization
+                fig = draw_pallet_3d(
+                    pallet_W, pallet_L, base_H,
+                    pallet["layers"], tolerance,
+                    color_mode="sku", height_limit=max_H,
+                )
+                st.plotly_chart(fig, use_container_width=True, key=f"order_3d_{selected_idx}")
 
         elif not plan_clicked:
             # Placeholder
